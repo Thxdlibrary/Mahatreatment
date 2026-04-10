@@ -1,0 +1,26 @@
+{
+  "name": "discord-music-bot",
+  "version": "1.0.0",
+  "description": "Admin-only Discord music bot for playing songs in voice channels",
+  "main": "discord_music_bot.js",
+  "scripts": {
+    "start": "node discord_music_bot.js",
+    "dev": "nodemon discord_music_bot.js"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "music",
+    "voice"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.14.0",
+    "@discordjs/voice": "^0.16.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
