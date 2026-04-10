@@ -139,7 +139,7 @@ async function playNextSong(guildId, voiceChannel, interaction) {
   }
 }
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
   console.log(`📁 Music folder: ${CONFIG.MUSIC_FOLDER}`);
   console.log(`🔐 Admin Role ID: ${CONFIG.ADMIN_ROLE_ID}`);
@@ -334,7 +334,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // Register slash commands
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   try {
     const commands = [
       new SlashCommandBuilder()
