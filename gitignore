@@ -14,7 +14,6 @@ yarn-error.log
 .idea/
 
 # Data and music files
-music/
 play_history.json
 queue_backup.json
 *.log
