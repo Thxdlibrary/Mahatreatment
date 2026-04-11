@@ -56,12 +56,11 @@ async function playNextSong(guildId, voiceChannel) {
   if (stopped.has(guildId)) return;
 
   const queue = getQueue(guildId);
-
   if (queue.length === 0) {
     const conn = getVoiceConnection(guildId);
     if (conn) conn.destroy();
     players.delete(guildId);
-    console.log(`Queue empty, disconnected.`);
+    console.log('Queue empty, disconnected.');
     return;
   }
 
@@ -75,42 +74,60 @@ async function playNextSong(guildId, voiceChannel) {
   }
 
   try {
-    // Get existing connection or create new one
     let connection = getVoiceConnection(guildId);
     if (!connection) {
       connection = joinVoiceChannel({
         channelId: voiceChannel.id,
         guildId: guildId,
         adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        selfDeaf: true,   // required for cloud deployments
+        selfMute: false,
       });
       console.log(`Joined voice channel: ${voiceChannel.name}`);
     }
 
-    // *** THE KEY FIX: Wait until the connection is fully Ready before playing ***
+    // Wait for Signaling OR Ready — Signaling is enough to start playing on Railway
+    // Railway often gets stuck at Connecting→Ready due to UDP NAT, but Signaling works
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-      console.log('Connection is Ready');
-    } catch (err) {
-      console.error('Connection never became Ready:', err);
-      connection.destroy();
-      return;
+      await entersState(connection, VoiceConnectionStatus.Signaling, 15_000);
+      console.log('Connection reached Signaling state, starting playback...');
+    } catch {
+      // If already past Signaling (i.e. Ready), that's fine too — just continue
+      console.log('Already past Signaling, continuing...');
     }
 
-    // Create player only once per guild
+    // Give it a small extra moment for UDP to stabilize on Railway's network
+    await new Promise(resolve => setTimeout(resolve, 1500));
+
     if (!players.has(guildId)) {
       const player = createAudioPlayer();
       players.set(guildId, player);
       connection.subscribe(player);
 
       player.on(AudioPlayerStatus.Idle, () => {
-        if (!stopped.has(guildId)) {
-          playNextSong(guildId, voiceChannel);
-        }
+        if (!stopped.has(guildId)) playNextSong(guildId, voiceChannel);
       });
 
       player.on('error', error => {
         console.error('Player error:', error.message);
         playNextSong(guildId, voiceChannel);
+      });
+
+      // Log connection state changes for debugging
+      connection.on(VoiceConnectionStatus.Connecting, () => console.log('Connection: Connecting...'));
+      connection.on(VoiceConnectionStatus.Signaling, () => console.log('Connection: Signaling'));
+      connection.on(VoiceConnectionStatus.Ready, () => console.log('Connection: Ready ✅'));
+      connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        console.log('Connection: Disconnected — attempting reconnect...');
+        try {
+          await Promise.race([
+            entersState(connection, VoiceConnectionStatus.Signaling, 5_000),
+            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+          ]);
+        } catch {
+          connection.destroy();
+          players.delete(guildId);
+        }
       });
     }
 
@@ -120,7 +137,7 @@ async function playNextSong(guildId, voiceChannel) {
     console.log(`▶️ Now playing: ${songName}`);
 
   } catch (err) {
-    console.error('Error in playNextSong:', err);
+    console.error('Error in playNextSong:', err.message);
   }
 }
 
