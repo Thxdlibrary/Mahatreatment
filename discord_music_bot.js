@@ -1,5 +1,5 @@
 const { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection, NoSubscriberBehavior } = require('@discordjs/voice');
 const ffmpegPath = require('ffmpeg-static');
 const sodium = require('libsodium-wrappers');
 const fs = require('fs');
@@ -75,68 +75,61 @@ async function playNextSong(guildId, voiceChannel) {
   }
 
   try {
-    let connection = getVoiceConnection(guildId);
-    if (!connection) {
-      connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: guildId,
-        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-        selfDeaf: true,
-        selfMute: false,
-      });
-      console.log(`Joined voice channel: ${voiceChannel.name}`);
-    }
+    // Always destroy old connection and make a fresh one
+    const oldConn = getVoiceConnection(guildId);
+    if (oldConn) oldConn.destroy();
+    players.delete(guildId);
 
-    // Wait fully for Ready state — sodium makes this reliable now
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-      console.log('Connection: Ready ✅');
-    } catch (err) {
-      console.error('Connection failed to become Ready:', err.message);
-      connection.destroy();
-      players.delete(guildId);
-      return;
-    }
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: guildId,
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+      selfDeaf: true,
+      selfMute: false,
+    });
+    console.log(`Joined voice channel: ${voiceChannel.name}`);
 
-    if (!players.has(guildId)) {
-      const player = createAudioPlayer();
-      players.set(guildId, player);
-      connection.subscribe(player);
+    // Create a fresh player with Pause behavior so audio buffers while connecting
+    const player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Pause,
+      },
+    });
+    players.set(guildId, player);
+    connection.subscribe(player);
 
-      player.on(AudioPlayerStatus.Idle, () => {
-        if (!stopped.has(guildId)) playNextSong(guildId, voiceChannel);
-      });
+    player.on(AudioPlayerStatus.Idle, () => {
+      if (!stopped.has(guildId)) playNextSong(guildId, voiceChannel);
+    });
 
-      player.on('error', error => {
-        console.error('Player error:', error.message);
-        playNextSong(guildId, voiceChannel);
-      });
+    player.on(AudioPlayerStatus.Playing, () => {
+      console.log(`🎵 Player confirmed Playing: ${songName}`);
+    });
 
-      connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        console.log('Disconnected — attempting reconnect...');
-        try {
-          await Promise.race([
-            entersState(connection, VoiceConnectionStatus.Signaling, 5_000),
-            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-          ]);
-        } catch {
-          connection.destroy();
-          players.delete(guildId);
-        }
-      });
-    }
+    player.on(AudioPlayerStatus.Buffering, () => {
+      console.log(`⏳ Buffering: ${songName}`);
+    });
 
-    const player = players.get(guildId);
+    player.on('error', error => {
+      console.error('Player error:', error.message);
+      playNextSong(guildId, voiceChannel);
+    });
+
+    connection.on('stateChange', (oldState, newState) => {
+      console.log(`Connection: ${oldState.status} → ${newState.status}`);
+    });
+
+    // Start playing immediately — NoSubscriberBehavior.Pause means it will
+    // buffer and wait until connection is subscribed and ready to receive
     const resource = createAudioResource(songPath, { inlineVolume: false });
     player.play(resource);
-    console.log(`▶️ Now playing: ${songName}`);
+    console.log(`▶️ Started player for: ${songName}`);
 
   } catch (err) {
     console.error('Error in playNextSong:', err.message);
   }
 }
 
-// Wait for sodium to be ready before starting the bot
 sodium.ready.then(() => {
   console.log('🔐 Sodium encryption ready');
 
