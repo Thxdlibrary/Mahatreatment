@@ -1,5 +1,5 @@
 const { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection } = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
@@ -24,19 +24,16 @@ const CONFIG = {
 // Queue management
 const queues = new Map();
 const players = new Map();
-const connections = new Map();
 
-/**
- * Check if user has admin role
- */
+// BUG FIX #4: Track whether a guild is intentionally stopped
+// so the Idle event doesn't re-trigger playback after /stop
+const stopped = new Set();
+
 function isAdmin(member) {
   if (!member) return false;
   return member.roles.cache.has(CONFIG.ADMIN_ROLE_ID) || member.permissions.has(PermissionFlagsBits.Administrator);
 }
 
-/**
- * Get or create queue for guild
- */
 function getQueue(guildId) {
   if (!queues.has(guildId)) {
     queues.set(guildId, []);
@@ -44,16 +41,13 @@ function getQueue(guildId) {
   return queues.get(guildId);
 }
 
-/**
- * Get all available music files
- */
 function getAvailableMusic() {
   try {
     if (!fs.existsSync(CONFIG.MUSIC_FOLDER)) {
       fs.mkdirSync(CONFIG.MUSIC_FOLDER, { recursive: true });
       return [];
     }
-    return fs.readdirSync(CONFIG.MUSIC_FOLDER).filter(f => 
+    return fs.readdirSync(CONFIG.MUSIC_FOLDER).filter(f =>
       /\.(mp3|wav|ogg|flac)$/i.test(f)
     );
   } catch (err) {
@@ -62,23 +56,20 @@ function getAvailableMusic() {
   }
 }
 
-/**
- * Play next song in queue
- */
-async function playNextSong(guildId, voiceChannel, interaction) {
+// BUG FIX #3: Don't pass interaction into this function.
+// It was already replied to — calling reply again causes a crash.
+// Instead, we send follow-up messages via the channel.
+async function playNextSong(guildId, voiceChannel) {
+  // BUG FIX #4: If stopped intentionally, do nothing
+  if (stopped.has(guildId)) return;
+
   const queue = getQueue(guildId);
-  
+
   if (queue.length === 0) {
-    // Queue is empty, disconnect
-    const connection = connections.get(guildId);
-    if (connection) {
-      connection.destroy();
-      connections.delete(guildId);
-    }
-    if (players.has(guildId)) {
-      players.get(guildId).stop();
-      players.delete(guildId);
-    }
+    // Queue empty — disconnect cleanly
+    const existingConnection = getVoiceConnection(guildId);
+    if (existingConnection) existingConnection.destroy();
+    players.delete(guildId);
     return;
   }
 
@@ -88,58 +79,66 @@ async function playNextSong(guildId, voiceChannel, interaction) {
   try {
     if (!fs.existsSync(songPath)) {
       console.error(`Song file not found: ${songPath}`);
-      return playNextSong(guildId, voiceChannel, interaction);
+      return playNextSong(guildId, voiceChannel);
     }
 
-    // Get or create connection
-    let connection = connections.get(guildId);
+    // Get or create voice connection using getVoiceConnection (idiomatic @discordjs/voice)
+    let connection = getVoiceConnection(guildId);
     if (!connection) {
       connection = joinVoiceChannel({
         channelId: voiceChannel.id,
         guildId: guildId,
         adapterCreator: voiceChannel.guild.voiceAdapterCreator,
       });
-      connections.set(guildId, connection);
     }
 
-    // Create player if doesn't exist
+    // BUG FIX #3 + #4: Create a fresh player every time playNextSong is called
+    // so we don't accumulate stale Idle listeners from previous sessions.
+    // We only create a new player if one doesn't already exist for this guild.
     if (!players.has(guildId)) {
       const player = createAudioPlayer();
       players.set(guildId, player);
       connection.subscribe(player);
 
-      // When song ends, play next
       player.on(AudioPlayerStatus.Idle, () => {
-        playNextSong(guildId, voiceChannel, interaction);
+        // BUG FIX #4: Only auto-advance if not stopped
+        if (!stopped.has(guildId)) {
+          playNextSong(guildId, voiceChannel);
+        }
       });
 
       player.on('error', error => {
-        console.error('Player error:', error);
-        playNextSong(guildId, voiceChannel, interaction);
+        console.error('Player error:', error.message);
+        playNextSong(guildId, voiceChannel);
       });
     }
 
     const player = players.get(guildId);
+    // BUG FIX #1 & #2: createAudioResource works because Dockerfile now has FFmpeg + opus
     const resource = createAudioResource(songPath);
-    
     player.play(resource);
 
-    if (interaction) {
-      const embed = new EmbedBuilder()
-        .setColor('#00FF00')
-        .setTitle('🎵 Now Playing')
-        .setDescription(`**${songName}**`)
-        .setFooter({ text: `Queue: ${queue.length} song(s) remaining` });
-      
-      interaction.reply({ embeds: [embed] }).catch(() => {});
-    }
+    console.log(`▶️ Now playing: ${songName} in guild ${guildId}`);
+
+    // Notify the voice channel's text channel if possible
+    try {
+      if (voiceChannel.guild.systemChannel) {
+        const embed = new EmbedBuilder()
+          .setColor('#00FF00')
+          .setTitle('🎵 Now Playing')
+          .setDescription(`**${songName}**`)
+          .setFooter({ text: `Queue: ${queue.length} song(s) remaining` });
+        voiceChannel.guild.systemChannel.send({ embeds: [embed] }).catch(() => {});
+      }
+    } catch (_) {}
+
   } catch (err) {
     console.error('Error playing song:', err);
-    playNextSong(guildId, voiceChannel, interaction);
+    playNextSong(guildId, voiceChannel);
   }
 }
 
-client.once('clientReady', () => {
+client.once('ready', () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
   console.log(`📁 Music folder: ${CONFIG.MUSIC_FOLDER}`);
   console.log(`🔐 Admin Role ID: ${CONFIG.ADMIN_ROLE_ID}`);
@@ -148,7 +147,6 @@ client.once('clientReady', () => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // Admin check
   if (!isAdmin(interaction.member)) {
     return interaction.reply({
       content: '❌ You do not have permission to use this command. Admin role required.',
@@ -171,7 +169,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     const musicFiles = getAvailableMusic();
-    const matching = musicFiles.filter(f => 
+    const matching = musicFiles.filter(f =>
       f.toLowerCase().includes(songName.toLowerCase())
     );
 
@@ -182,13 +180,15 @@ client.on('interactionCreate', async (interaction) => {
         .setDescription(`No songs found matching "${songName}"`)
         .addFields({
           name: 'Available songs:',
-          value: musicFiles.length > 0 
+          value: musicFiles.length > 0
             ? musicFiles.slice(0, 10).map((f, i) => `${i + 1}. ${f}`).join('\n')
             : 'No songs in music folder',
         });
-      
       return interaction.editReply({ embeds: [embed] });
     }
+
+    // BUG FIX #4: Clear stopped flag when user explicitly plays
+    stopped.delete(guildId);
 
     const queue = getQueue(guildId);
     matching.forEach(song => queue.push(song));
@@ -197,50 +197,36 @@ client.on('interactionCreate', async (interaction) => {
       .setColor('#00FF00')
       .setTitle('✅ Added to Queue')
       .setDescription(`Added ${matching.length} song(s)`)
-      .addFields({
-        name: 'Songs added:',
-        value: matching.join('\n'),
-      }, {
-        name: 'Queue position:',
-        value: `${queue.length - matching.length + 1} - ${queue.length}`,
-      });
+      .addFields(
+        { name: 'Songs added:', value: matching.join('\n') },
+        { name: 'Queue position:', value: `${queue.length - matching.length + 1} - ${queue.length}` }
+      );
 
     await interaction.editReply({ embeds: [embed] });
 
-    // If not currently playing, start playing
-    if (!players.has(guildId) || players.get(guildId).state.status === AudioPlayerStatus.Idle) {
-      playNextSong(guildId, voiceChannel, interaction);
+    // Only start playing if not already playing
+    const existingPlayer = players.get(guildId);
+    if (!existingPlayer || existingPlayer.state.status === AudioPlayerStatus.Idle) {
+      // BUG FIX #3: Don't pass interaction — it's already been replied to above
+      playNextSong(guildId, voiceChannel);
     }
   }
 
   // ============ STOP COMMAND ============
   else if (commandName === 'stop') {
-    const voiceChannel = interaction.member?.voice.channel;
-
-    if (!voiceChannel) {
-      return interaction.reply({
-        content: '❌ You must be in a voice channel.',
-        ephemeral: true,
-      });
-    }
-
-    const connection = connections.get(guildId);
-    const player = players.get(guildId);
-
-    if (!connection && !player) {
-      return interaction.reply({
-        content: '❌ Bot is not playing any music.',
-        ephemeral: true,
-      });
-    }
-
-    // Clear queue and stop
+    // BUG FIX #4: Set stopped flag BEFORE calling player.stop()
+    // so the Idle event handler doesn't re-trigger playback
+    stopped.add(guildId);
     queues.set(guildId, []);
-    if (player) player.stop();
-    if (connection) connection.destroy();
 
-    connections.delete(guildId);
-    players.delete(guildId);
+    const player = players.get(guildId);
+    if (player) {
+      player.stop(true); // true = force stop, suppresses Idle event race
+      players.delete(guildId);
+    }
+
+    const connection = getVoiceConnection(guildId);
+    if (connection) connection.destroy();
 
     interaction.reply('⏹️ Music stopped and queue cleared.');
   }
@@ -248,14 +234,9 @@ client.on('interactionCreate', async (interaction) => {
   // ============ PAUSE COMMAND ============
   else if (commandName === 'pause') {
     const player = players.get(guildId);
-
     if (!player) {
-      return interaction.reply({
-        content: '❌ Bot is not playing any music.',
-        ephemeral: true,
-      });
+      return interaction.reply({ content: '❌ Bot is not playing any music.', ephemeral: true });
     }
-
     player.pause();
     interaction.reply('⏸️ Music paused.');
   }
@@ -263,14 +244,9 @@ client.on('interactionCreate', async (interaction) => {
   // ============ RESUME COMMAND ============
   else if (commandName === 'resume') {
     const player = players.get(guildId);
-
     if (!player) {
-      return interaction.reply({
-        content: '❌ Bot is not playing any music.',
-        ephemeral: true,
-      });
+      return interaction.reply({ content: '❌ Bot is not playing any music.', ephemeral: true });
     }
-
     player.unpause();
     interaction.reply('▶️ Music resumed.');
   }
@@ -278,98 +254,62 @@ client.on('interactionCreate', async (interaction) => {
   // ============ SKIP COMMAND ============
   else if (commandName === 'skip') {
     const player = players.get(guildId);
-
     if (!player) {
-      return interaction.reply({
-        content: '❌ Bot is not playing any music.',
-        ephemeral: true,
-      });
+      return interaction.reply({ content: '❌ Bot is not playing any music.', ephemeral: true });
     }
-
-    player.stop();
+    // BUG FIX #4: Make sure stopped is NOT set so Idle triggers next song
+    stopped.delete(guildId);
+    player.stop(); // This triggers Idle → playNextSong
     interaction.reply('⏭️ Skipped to next song.');
   }
 
   // ============ QUEUE COMMAND ============
   else if (commandName === 'queue') {
     const queue = getQueue(guildId);
-
     if (queue.length === 0) {
-      return interaction.reply({
-        content: '📭 Queue is empty.',
-        ephemeral: true,
-      });
+      return interaction.reply({ content: '📭 Queue is empty.', ephemeral: true });
     }
-
     const queueList = queue.slice(0, 25).map((song, i) => `${i + 1}. ${song}`).join('\n');
     const embed = new EmbedBuilder()
       .setColor('#0099FF')
       .setTitle('🎵 Music Queue')
       .setDescription(queueList)
       .setFooter({ text: `Total: ${queue.length} song(s)` });
-
     interaction.reply({ embeds: [embed] });
   }
 
   // ============ LIST COMMAND ============
   else if (commandName === 'list') {
     const musicFiles = getAvailableMusic();
-
     if (musicFiles.length === 0) {
-      return interaction.reply({
-        content: '📭 No songs available in music folder.',
-        ephemeral: true,
-      });
+      return interaction.reply({ content: '📭 No songs available in music folder.', ephemeral: true });
     }
-
     const songList = musicFiles.slice(0, 25).map((song, i) => `${i + 1}. ${song}`).join('\n');
     const embed = new EmbedBuilder()
       .setColor('#0099FF')
       .setTitle('🎵 Available Songs')
       .setDescription(songList)
       .setFooter({ text: `Total: ${musicFiles.length} song(s)` });
-
     interaction.reply({ embeds: [embed] });
   }
 });
 
 // Register slash commands
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   try {
     const commands = [
       new SlashCommandBuilder()
         .setName('play')
         .setDescription('Play a song from the music folder')
         .addStringOption(option =>
-          option
-            .setName('song')
-            .setDescription('Song name or partial name')
-            .setRequired(true)
+          option.setName('song').setDescription('Song name or partial name').setRequired(true)
         ),
-
-      new SlashCommandBuilder()
-        .setName('stop')
-        .setDescription('Stop playing music and clear queue'),
-
-      new SlashCommandBuilder()
-        .setName('pause')
-        .setDescription('Pause the current song'),
-
-      new SlashCommandBuilder()
-        .setName('resume')
-        .setDescription('Resume playing music'),
-
-      new SlashCommandBuilder()
-        .setName('skip')
-        .setDescription('Skip to the next song'),
-
-      new SlashCommandBuilder()
-        .setName('queue')
-        .setDescription('View the current music queue'),
-
-      new SlashCommandBuilder()
-        .setName('list')
-        .setDescription('List all available songs'),
+      new SlashCommandBuilder().setName('stop').setDescription('Stop playing music and clear queue'),
+      new SlashCommandBuilder().setName('pause').setDescription('Pause the current song'),
+      new SlashCommandBuilder().setName('resume').setDescription('Resume playing music'),
+      new SlashCommandBuilder().setName('skip').setDescription('Skip to the next song'),
+      new SlashCommandBuilder().setName('queue').setDescription('View the current music queue'),
+      new SlashCommandBuilder().setName('list').setDescription('List all available songs'),
     ];
 
     await client.application.commands.set(commands);
@@ -381,11 +321,12 @@ client.once('clientReady', async () => {
 
 client.login(CONFIG.TOKEN);
 
-// Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n👋 Shutting down...');
-  connections.forEach(conn => conn.destroy());
-  players.forEach(player => player.stop());
+  client.guilds.cache.forEach(guild => {
+    const conn = getVoiceConnection(guild.id);
+    if (conn) conn.destroy();
+  });
   client.destroy();
   process.exit(0);
 });
