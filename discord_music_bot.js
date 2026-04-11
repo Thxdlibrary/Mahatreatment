@@ -1,11 +1,10 @@
 const { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-// Tell @discordjs/voice where ffmpeg is (the npm package version)
 process.env.FFMPEG_PATH = ffmpegPath;
 
 const client = new Client({
@@ -62,7 +61,7 @@ async function playNextSong(guildId, voiceChannel) {
     const conn = getVoiceConnection(guildId);
     if (conn) conn.destroy();
     players.delete(guildId);
-    console.log(`Queue empty, disconnected from guild ${guildId}`);
+    console.log(`Queue empty, disconnected.`);
     return;
   }
 
@@ -76,6 +75,7 @@ async function playNextSong(guildId, voiceChannel) {
   }
 
   try {
+    // Get existing connection or create new one
     let connection = getVoiceConnection(guildId);
     if (!connection) {
       connection = joinVoiceChannel({
@@ -86,6 +86,17 @@ async function playNextSong(guildId, voiceChannel) {
       console.log(`Joined voice channel: ${voiceChannel.name}`);
     }
 
+    // *** THE KEY FIX: Wait until the connection is fully Ready before playing ***
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+      console.log('Connection is Ready');
+    } catch (err) {
+      console.error('Connection never became Ready:', err);
+      connection.destroy();
+      return;
+    }
+
+    // Create player only once per guild
     if (!players.has(guildId)) {
       const player = createAudioPlayer();
       players.set(guildId, player);
@@ -98,34 +109,26 @@ async function playNextSong(guildId, voiceChannel) {
       });
 
       player.on('error', error => {
-        console.error('Player error:', error.message, error.resource?.metadata);
+        console.error('Player error:', error.message);
         playNextSong(guildId, voiceChannel);
       });
     }
 
     const player = players.get(guildId);
-
-    // Use ffmpeg-static path explicitly in the resource
-    const resource = createAudioResource(songPath, {
-      inlineVolume: false,
-    });
-
+    const resource = createAudioResource(songPath, { inlineVolume: false });
     player.play(resource);
     console.log(`▶️ Now playing: ${songName}`);
 
   } catch (err) {
     console.error('Error in playNextSong:', err);
-    playNextSong(guildId, voiceChannel);
   }
 }
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ Bot is online as ${client.user.tag}`);
   console.log(`📁 Music folder: ${CONFIG.MUSIC_FOLDER}`);
   console.log(`🔐 Admin Role ID: ${CONFIG.ADMIN_ROLE_ID}`);
   console.log(`🎵 FFmpeg path: ${ffmpegPath}`);
-
-  // Log available songs at startup
   const songs = getAvailableMusic();
   console.log(`🎶 Found ${songs.length} song(s): ${songs.join(', ') || 'none'}`);
 });
@@ -198,16 +201,10 @@ client.on('interactionCreate', async (interaction) => {
   else if (commandName === 'stop') {
     stopped.add(guildId);
     queues.set(guildId, []);
-
     const player = players.get(guildId);
-    if (player) {
-      player.stop(true);
-      players.delete(guildId);
-    }
-
+    if (player) { player.stop(true); players.delete(guildId); }
     const connection = getVoiceConnection(guildId);
     if (connection) connection.destroy();
-
     interaction.reply('⏹️ Music stopped and queue cleared.');
   }
 
@@ -256,7 +253,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   try {
     const commands = [
       new SlashCommandBuilder()
