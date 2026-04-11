@@ -8,10 +8,6 @@ require('dotenv').config();
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
-// ✅ CRITICAL FIX FOR RAILWAY: Force Discord voice to use port 443 (TCP)
-// instead of random UDP ports which Railway blocks
-process.env.VOICE_GATEWAY = 'wss://gateway.discord.gg';
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -92,20 +88,21 @@ async function playNextSong(guildId, voiceChannel) {
     });
     console.log(`Joined voice channel: ${voiceChannel.name}`);
 
-    // Log every connection state change
     connection.on('stateChange', (oldState, newState) => {
-      console.log(`Connection state: ${oldState.status} → ${newState.status}`);
+      console.log(`Connection: ${oldState.status} → ${newState.status}`);
+      // If stuck in signalling loop, force destroy and retry after delay
+      if (oldState.status === newState.status && newState.status === VoiceConnectionStatus.Signaling) {
+        console.log('Stuck in signalling loop — destroying and retrying in 3s...');
+        connection.destroy();
+        players.delete(guildId);
+        setTimeout(() => {
+          if (!stopped.has(guildId)) {
+            queue.unshift(songName); // put song back
+            playNextSong(guildId, voiceChannel);
+          }
+        }, 3000);
+      }
     });
-
-    // Wait for Ready with a generous timeout
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-      console.log('✅ Connection Ready!');
-    } catch (err) {
-      console.error('Connection timed out:', err.message);
-      // Don't destroy — try playing anyway, sometimes it works
-      console.log('Attempting to play despite timeout...');
-    }
 
     const player = createAudioPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
@@ -159,20 +156,13 @@ sodium.ready.then(() => {
 
     if (commandName === 'play') {
       await interaction.deferReply();
-
       const songName = interaction.options.getString('song');
       const voiceChannel = interaction.member?.voice.channel;
 
-      if (!voiceChannel) {
-        return interaction.editReply('❌ You must be in a voice channel to play music.');
-      }
+      if (!voiceChannel) return interaction.editReply('❌ You must be in a voice channel.');
 
       const musicFiles = getAvailableMusic();
-      console.log(`Available songs: ${musicFiles.join(', ')}`);
-
-      const matching = musicFiles.filter(f =>
-        f.toLowerCase().includes(songName.toLowerCase())
-      );
+      const matching = musicFiles.filter(f => f.toLowerCase().includes(songName.toLowerCase()));
 
       if (matching.length === 0) {
         const embed = new EmbedBuilder()
