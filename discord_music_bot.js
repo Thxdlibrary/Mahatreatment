@@ -1,6 +1,7 @@
 const { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 const ffmpegPath = require('ffmpeg-static');
+const sodium = require('libsodium-wrappers');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
@@ -80,24 +81,22 @@ async function playNextSong(guildId, voiceChannel) {
         channelId: voiceChannel.id,
         guildId: guildId,
         adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-        selfDeaf: true,   // required for cloud deployments
+        selfDeaf: true,
         selfMute: false,
       });
       console.log(`Joined voice channel: ${voiceChannel.name}`);
     }
 
-    // Wait for Signaling OR Ready — Signaling is enough to start playing on Railway
-    // Railway often gets stuck at Connecting→Ready due to UDP NAT, but Signaling works
+    // Wait fully for Ready state — sodium makes this reliable now
     try {
-      await entersState(connection, VoiceConnectionStatus.Signaling, 15_000);
-      console.log('Connection reached Signaling state, starting playback...');
-    } catch {
-      // If already past Signaling (i.e. Ready), that's fine too — just continue
-      console.log('Already past Signaling, continuing...');
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      console.log('Connection: Ready ✅');
+    } catch (err) {
+      console.error('Connection failed to become Ready:', err.message);
+      connection.destroy();
+      players.delete(guildId);
+      return;
     }
-
-    // Give it a small extra moment for UDP to stabilize on Railway's network
-    await new Promise(resolve => setTimeout(resolve, 1500));
 
     if (!players.has(guildId)) {
       const player = createAudioPlayer();
@@ -113,12 +112,8 @@ async function playNextSong(guildId, voiceChannel) {
         playNextSong(guildId, voiceChannel);
       });
 
-      // Log connection state changes for debugging
-      connection.on(VoiceConnectionStatus.Connecting, () => console.log('Connection: Connecting...'));
-      connection.on(VoiceConnectionStatus.Signaling, () => console.log('Connection: Signaling'));
-      connection.on(VoiceConnectionStatus.Ready, () => console.log('Connection: Ready ✅'));
       connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        console.log('Connection: Disconnected — attempting reconnect...');
+        console.log('Disconnected — attempting reconnect...');
         try {
           await Promise.race([
             entersState(connection, VoiceConnectionStatus.Signaling, 5_000),
@@ -141,157 +136,162 @@ async function playNextSong(guildId, voiceChannel) {
   }
 }
 
-client.once('clientReady', () => {
-  console.log(`✅ Bot is online as ${client.user.tag}`);
-  console.log(`📁 Music folder: ${CONFIG.MUSIC_FOLDER}`);
-  console.log(`🔐 Admin Role ID: ${CONFIG.ADMIN_ROLE_ID}`);
-  console.log(`🎵 FFmpeg path: ${ffmpegPath}`);
-  const songs = getAvailableMusic();
-  console.log(`🎶 Found ${songs.length} song(s): ${songs.join(', ') || 'none'}`);
-});
+// Wait for sodium to be ready before starting the bot
+sodium.ready.then(() => {
+  console.log('🔐 Sodium encryption ready');
 
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  client.once('clientReady', () => {
+    console.log(`✅ Bot is online as ${client.user.tag}`);
+    console.log(`📁 Music folder: ${CONFIG.MUSIC_FOLDER}`);
+    console.log(`🔐 Admin Role ID: ${CONFIG.ADMIN_ROLE_ID}`);
+    console.log(`🎵 FFmpeg path: ${ffmpegPath}`);
+    const songs = getAvailableMusic();
+    console.log(`🎶 Found ${songs.length} song(s): ${songs.join(', ') || 'none'}`);
+  });
 
-  if (!isAdmin(interaction.member)) {
-    return interaction.reply({
-      content: '❌ You do not have permission to use this command. Admin role required.',
-      ephemeral: true,
-    });
-  }
+  client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
 
-  const { commandName } = interaction;
-  const guildId = interaction.guildId;
-
-  if (commandName === 'play') {
-    await interaction.deferReply();
-
-    const songName = interaction.options.getString('song');
-    const voiceChannel = interaction.member?.voice.channel;
-
-    if (!voiceChannel) {
-      return interaction.editReply('❌ You must be in a voice channel to play music.');
+    if (!isAdmin(interaction.member)) {
+      return interaction.reply({
+        content: '❌ You do not have permission to use this command. Admin role required.',
+        ephemeral: true,
+      });
     }
 
-    const musicFiles = getAvailableMusic();
-    console.log(`Available songs: ${musicFiles.join(', ')}`);
+    const { commandName } = interaction;
+    const guildId = interaction.guildId;
 
-    const matching = musicFiles.filter(f =>
-      f.toLowerCase().includes(songName.toLowerCase())
-    );
+    if (commandName === 'play') {
+      await interaction.deferReply();
 
-    if (matching.length === 0) {
-      const embed = new EmbedBuilder()
-        .setColor('#FF0000')
-        .setTitle('❌ Song Not Found')
-        .setDescription(`No songs found matching "${songName}"`)
-        .addFields({
-          name: 'Available songs:',
-          value: musicFiles.length > 0
-            ? musicFiles.slice(0, 10).map((f, i) => `${i + 1}. ${f}`).join('\n')
-            : 'No songs in music folder',
-        });
-      return interaction.editReply({ embeds: [embed] });
-    }
+      const songName = interaction.options.getString('song');
+      const voiceChannel = interaction.member?.voice.channel;
 
-    stopped.delete(guildId);
-    const queue = getQueue(guildId);
-    matching.forEach(song => queue.push(song));
+      if (!voiceChannel) {
+        return interaction.editReply('❌ You must be in a voice channel to play music.');
+      }
 
-    const embed = new EmbedBuilder()
-      .setColor('#00FF00')
-      .setTitle('✅ Added to Queue')
-      .setDescription(`Added ${matching.length} song(s)`)
-      .addFields(
-        { name: 'Songs added:', value: matching.join('\n') },
-        { name: 'Queue position:', value: `${queue.length - matching.length + 1} - ${queue.length}` }
+      const musicFiles = getAvailableMusic();
+      console.log(`Available songs: ${musicFiles.join(', ')}`);
+
+      const matching = musicFiles.filter(f =>
+        f.toLowerCase().includes(songName.toLowerCase())
       );
 
-    await interaction.editReply({ embeds: [embed] });
+      if (matching.length === 0) {
+        const embed = new EmbedBuilder()
+          .setColor('#FF0000')
+          .setTitle('❌ Song Not Found')
+          .setDescription(`No songs found matching "${songName}"`)
+          .addFields({
+            name: 'Available songs:',
+            value: musicFiles.length > 0
+              ? musicFiles.slice(0, 10).map((f, i) => `${i + 1}. ${f}`).join('\n')
+              : 'No songs in music folder',
+          });
+        return interaction.editReply({ embeds: [embed] });
+      }
 
-    const existingPlayer = players.get(guildId);
-    if (!existingPlayer || existingPlayer.state.status === AudioPlayerStatus.Idle) {
-      playNextSong(guildId, voiceChannel);
+      stopped.delete(guildId);
+      const queue = getQueue(guildId);
+      matching.forEach(song => queue.push(song));
+
+      const embed = new EmbedBuilder()
+        .setColor('#00FF00')
+        .setTitle('✅ Added to Queue')
+        .setDescription(`Added ${matching.length} song(s)`)
+        .addFields(
+          { name: 'Songs added:', value: matching.join('\n') },
+          { name: 'Queue position:', value: `${queue.length - matching.length + 1} - ${queue.length}` }
+        );
+
+      await interaction.editReply({ embeds: [embed] });
+
+      const existingPlayer = players.get(guildId);
+      if (!existingPlayer || existingPlayer.state.status === AudioPlayerStatus.Idle) {
+        playNextSong(guildId, voiceChannel);
+      }
     }
-  }
 
-  else if (commandName === 'stop') {
-    stopped.add(guildId);
-    queues.set(guildId, []);
-    const player = players.get(guildId);
-    if (player) { player.stop(true); players.delete(guildId); }
-    const connection = getVoiceConnection(guildId);
-    if (connection) connection.destroy();
-    interaction.reply('⏹️ Music stopped and queue cleared.');
-  }
+    else if (commandName === 'stop') {
+      stopped.add(guildId);
+      queues.set(guildId, []);
+      const player = players.get(guildId);
+      if (player) { player.stop(true); players.delete(guildId); }
+      const connection = getVoiceConnection(guildId);
+      if (connection) connection.destroy();
+      interaction.reply('⏹️ Music stopped and queue cleared.');
+    }
 
-  else if (commandName === 'pause') {
-    const player = players.get(guildId);
-    if (!player) return interaction.reply({ content: '❌ Not playing anything.', ephemeral: true });
-    player.pause();
-    interaction.reply('⏸️ Paused.');
-  }
+    else if (commandName === 'pause') {
+      const player = players.get(guildId);
+      if (!player) return interaction.reply({ content: '❌ Not playing anything.', ephemeral: true });
+      player.pause();
+      interaction.reply('⏸️ Paused.');
+    }
 
-  else if (commandName === 'resume') {
-    const player = players.get(guildId);
-    if (!player) return interaction.reply({ content: '❌ Not playing anything.', ephemeral: true });
-    player.unpause();
-    interaction.reply('▶️ Resumed.');
-  }
+    else if (commandName === 'resume') {
+      const player = players.get(guildId);
+      if (!player) return interaction.reply({ content: '❌ Not playing anything.', ephemeral: true });
+      player.unpause();
+      interaction.reply('▶️ Resumed.');
+    }
 
-  else if (commandName === 'skip') {
-    const player = players.get(guildId);
-    if (!player) return interaction.reply({ content: '❌ Not playing anything.', ephemeral: true });
-    stopped.delete(guildId);
-    player.stop();
-    interaction.reply('⏭️ Skipped.');
-  }
+    else if (commandName === 'skip') {
+      const player = players.get(guildId);
+      if (!player) return interaction.reply({ content: '❌ Not playing anything.', ephemeral: true });
+      stopped.delete(guildId);
+      player.stop();
+      interaction.reply('⏭️ Skipped.');
+    }
 
-  else if (commandName === 'queue') {
-    const queue = getQueue(guildId);
-    if (queue.length === 0) return interaction.reply({ content: '📭 Queue is empty.', ephemeral: true });
-    const embed = new EmbedBuilder()
-      .setColor('#0099FF')
-      .setTitle('🎵 Music Queue')
-      .setDescription(queue.slice(0, 25).map((s, i) => `${i + 1}. ${s}`).join('\n'))
-      .setFooter({ text: `Total: ${queue.length} song(s)` });
-    interaction.reply({ embeds: [embed] });
-  }
+    else if (commandName === 'queue') {
+      const queue = getQueue(guildId);
+      if (queue.length === 0) return interaction.reply({ content: '📭 Queue is empty.', ephemeral: true });
+      const embed = new EmbedBuilder()
+        .setColor('#0099FF')
+        .setTitle('🎵 Music Queue')
+        .setDescription(queue.slice(0, 25).map((s, i) => `${i + 1}. ${s}`).join('\n'))
+        .setFooter({ text: `Total: ${queue.length} song(s)` });
+      interaction.reply({ embeds: [embed] });
+    }
 
-  else if (commandName === 'list') {
-    const musicFiles = getAvailableMusic();
-    if (musicFiles.length === 0) return interaction.reply({ content: '📭 No songs found.', ephemeral: true });
-    const embed = new EmbedBuilder()
-      .setColor('#0099FF')
-      .setTitle('🎵 Available Songs')
-      .setDescription(musicFiles.slice(0, 25).map((s, i) => `${i + 1}. ${s}`).join('\n'))
-      .setFooter({ text: `Total: ${musicFiles.length} song(s)` });
-    interaction.reply({ embeds: [embed] });
-  }
+    else if (commandName === 'list') {
+      const musicFiles = getAvailableMusic();
+      if (musicFiles.length === 0) return interaction.reply({ content: '📭 No songs found.', ephemeral: true });
+      const embed = new EmbedBuilder()
+        .setColor('#0099FF')
+        .setTitle('🎵 Available Songs')
+        .setDescription(musicFiles.slice(0, 25).map((s, i) => `${i + 1}. ${s}`).join('\n'))
+        .setFooter({ text: `Total: ${musicFiles.length} song(s)` });
+      interaction.reply({ embeds: [embed] });
+    }
+  });
+
+  client.once('clientReady', async () => {
+    try {
+      const commands = [
+        new SlashCommandBuilder()
+          .setName('play')
+          .setDescription('Play a song from the music folder')
+          .addStringOption(o => o.setName('song').setDescription('Song name or partial name').setRequired(true)),
+        new SlashCommandBuilder().setName('stop').setDescription('Stop playing music and clear queue'),
+        new SlashCommandBuilder().setName('pause').setDescription('Pause the current song'),
+        new SlashCommandBuilder().setName('resume').setDescription('Resume playing music'),
+        new SlashCommandBuilder().setName('skip').setDescription('Skip to the next song'),
+        new SlashCommandBuilder().setName('queue').setDescription('View the current music queue'),
+        new SlashCommandBuilder().setName('list').setDescription('List all available songs'),
+      ];
+      await client.application.commands.set(commands);
+      console.log('✅ Slash commands registered');
+    } catch (err) {
+      console.error('Error registering commands:', err);
+    }
+  });
+
+  client.login(CONFIG.TOKEN);
 });
-
-client.once('clientReady', async () => {
-  try {
-    const commands = [
-      new SlashCommandBuilder()
-        .setName('play')
-        .setDescription('Play a song from the music folder')
-        .addStringOption(o => o.setName('song').setDescription('Song name or partial name').setRequired(true)),
-      new SlashCommandBuilder().setName('stop').setDescription('Stop playing music and clear queue'),
-      new SlashCommandBuilder().setName('pause').setDescription('Pause the current song'),
-      new SlashCommandBuilder().setName('resume').setDescription('Resume playing music'),
-      new SlashCommandBuilder().setName('skip').setDescription('Skip to the next song'),
-      new SlashCommandBuilder().setName('queue').setDescription('View the current music queue'),
-      new SlashCommandBuilder().setName('list').setDescription('List all available songs'),
-    ];
-    await client.application.commands.set(commands);
-    console.log('✅ Slash commands registered');
-  } catch (err) {
-    console.error('Error registering commands:', err);
-  }
-});
-
-client.login(CONFIG.TOKEN);
 
 process.on('SIGINT', () => {
   client.guilds.cache.forEach(guild => {
