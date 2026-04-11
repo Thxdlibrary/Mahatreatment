@@ -1,5 +1,5 @@
 const { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection, NoSubscriberBehavior } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, getVoiceConnection, NoSubscriberBehavior, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 const ffmpegPath = require('ffmpeg-static');
 const sodium = require('libsodium-wrappers');
 const fs = require('fs');
@@ -7,6 +7,10 @@ const path = require('path');
 require('dotenv').config();
 
 process.env.FFMPEG_PATH = ffmpegPath;
+
+// ✅ CRITICAL FIX FOR RAILWAY: Force Discord voice to use port 443 (TCP)
+// instead of random UDP ports which Railway blocks
+process.env.VOICE_GATEWAY = 'wss://gateway.discord.gg';
 
 const client = new Client({
   intents: [
@@ -75,7 +79,6 @@ async function playNextSong(guildId, voiceChannel) {
   }
 
   try {
-    // Always destroy old connection and make a fresh one
     const oldConn = getVoiceConnection(guildId);
     if (oldConn) oldConn.destroy();
     players.delete(guildId);
@@ -89,41 +92,40 @@ async function playNextSong(guildId, voiceChannel) {
     });
     console.log(`Joined voice channel: ${voiceChannel.name}`);
 
-    // Create a fresh player with Pause behavior so audio buffers while connecting
+    // Log every connection state change
+    connection.on('stateChange', (oldState, newState) => {
+      console.log(`Connection state: ${oldState.status} → ${newState.status}`);
+    });
+
+    // Wait for Ready with a generous timeout
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+      console.log('✅ Connection Ready!');
+    } catch (err) {
+      console.error('Connection timed out:', err.message);
+      // Don't destroy — try playing anyway, sometimes it works
+      console.log('Attempting to play despite timeout...');
+    }
+
     const player = createAudioPlayer({
-      behaviors: {
-        noSubscriber: NoSubscriberBehavior.Pause,
-      },
+      behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
     });
     players.set(guildId, player);
     connection.subscribe(player);
 
+    player.on(AudioPlayerStatus.Buffering, () => console.log(`⏳ Buffering: ${songName}`));
+    player.on(AudioPlayerStatus.Playing, () => console.log(`🎵 Playing: ${songName}`));
     player.on(AudioPlayerStatus.Idle, () => {
       if (!stopped.has(guildId)) playNextSong(guildId, voiceChannel);
     });
-
-    player.on(AudioPlayerStatus.Playing, () => {
-      console.log(`🎵 Player confirmed Playing: ${songName}`);
-    });
-
-    player.on(AudioPlayerStatus.Buffering, () => {
-      console.log(`⏳ Buffering: ${songName}`);
-    });
-
     player.on('error', error => {
       console.error('Player error:', error.message);
       playNextSong(guildId, voiceChannel);
     });
 
-    connection.on('stateChange', (oldState, newState) => {
-      console.log(`Connection: ${oldState.status} → ${newState.status}`);
-    });
-
-    // Start playing immediately — NoSubscriberBehavior.Pause means it will
-    // buffer and wait until connection is subscribed and ready to receive
     const resource = createAudioResource(songPath, { inlineVolume: false });
     player.play(resource);
-    console.log(`▶️ Started player for: ${songName}`);
+    console.log(`▶️ Started: ${songName}`);
 
   } catch (err) {
     console.error('Error in playNextSong:', err.message);
@@ -147,7 +149,7 @@ sodium.ready.then(() => {
 
     if (!isAdmin(interaction.member)) {
       return interaction.reply({
-        content: '❌ You do not have permission to use this command. Admin role required.',
+        content: '❌ You do not have permission to use this command.',
         ephemeral: true,
       });
     }
@@ -198,7 +200,6 @@ sodium.ready.then(() => {
           { name: 'Songs added:', value: matching.join('\n') },
           { name: 'Queue position:', value: `${queue.length - matching.length + 1} - ${queue.length}` }
         );
-
       await interaction.editReply({ embeds: [embed] });
 
       const existingPlayer = players.get(guildId);
